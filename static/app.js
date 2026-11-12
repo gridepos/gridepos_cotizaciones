@@ -30,4 +30,26 @@ $('#backup').onclick=async()=>{try{const blob=await(await api('/api/backup')).bl
 $('#restore').onclick=()=>$('#backup-file').click();
 $('#backup-file').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f)return;if(f.size>8*1024*1024){status('El respaldo supera los 8 MB.',true);return}if(!confirm('¿Añadir los documentos de este respaldo? Se conservarán los documentos existentes, incluidas las versiones de identificadores ya presentes.'))return;try{const raw=await f.text();const result=await(await api('/api/restore',{method:'POST',body:raw})).json();await history();status(`${result.restored} documentos restaurados; ${result.skipped} ya existían y se conservaron.`)}catch(e){status(e.message,true)}};
 window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue=''}});
-q=fresh();draw();history().catch(e=>status(e.message,true));api('/api/info').then(r=>r.json()).then(i=>$('#data-path').textContent='Datos: '+i.data_dir).catch(()=>{});
+const versionsButton=document.createElement('button');versionsButton.type='button';versionsButton.textContent='Versiones';versionsButton.id='versions';document.querySelector('main header nav').append(versionsButton);
+const versionsDialog=document.createElement('dialog');versionsDialog.id='versions-dialog';document.body.append(versionsDialog);
+versionsButton.onclick=async()=>{
+  if(!current){status('Guarda el documento para conservar su primera versión.',true);return}
+  const id=current;
+  try{
+    const versions=await(await api('/api/revisions/'+id)).json();
+    if(current!==id)return;
+    versionsDialog.innerHTML='<div class="versions-heading"><h2>Versiones guardadas</h2><button type="button" data-close aria-label="Cerrar">×</button></div><p class="hint">Cargar una versión conserva las demás. Al guardar se creará una revisión nueva.</p>'+versions.map(v=>`<div class="version-row"><div><b>Revisión ${v.revision}</b><small>${esc(new Date(v.saved_at).toLocaleString('es-DO'))}</small></div><button type="button" data-revision="${v.revision}">Cargar en editor</button></div>`).join('');
+    versionsDialog.querySelector('[data-close]').onclick=()=>versionsDialog.close();
+    versionsDialog.querySelectorAll('[data-revision]').forEach(button=>button.onclick=async()=>{
+      if(dirty&&!confirm('¿Cargar esta versión y descartar los cambios sin guardar?'))return;
+      try{
+        const old=await(await api('/api/revisions/'+id+'/'+button.dataset.revision)).json();
+        const latest=await(await api('/api/quotes/'+id)).json();
+        if(current!==id)return;
+        old.revision=latest.revision;q=old;dirty=true;draw();versionsDialog.close();status('Versión cargada. Guarda para conservarla como una revisión nueva.');
+      }catch(e){status(e.message,true)}
+    });
+    versionsDialog.showModal();
+  }catch(e){status(e.message,true)}
+};
+q=fresh();draw();history().catch(e=>status(e.message,true));api('/api/info').then(r=>r.json()).then(i=>$('#data-path').textContent='Datos: '+i.data_dir+' · Respaldos automáticos: '+i.backup_dir).catch(()=>{});

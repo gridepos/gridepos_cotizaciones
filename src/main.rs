@@ -457,6 +457,49 @@ fn header<'a>(req: &'a Request, key: &'static str) -> Option<&'a str> {
 fn json_bytes(v: Value) -> Vec<u8> {
     serde_json::to_vec(&v).unwrap()
 }
+fn automatic_backup(db: &Connection, dir: &std::path::Path, reason: &str) -> AppResult<PathBuf> {
+    let folder = dir.join("respaldos-automaticos");
+    fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+    let name = if reason == "diario" {
+        format!("GridePOS-{}.sqlite3", Local::now().format("%Y-%m-%d"))
+    } else {
+        format!(
+            "GridePOS-{}-{}-{}.sqlite3",
+            reason,
+            Local::now().format("%Y%m%d-%H%M%S"),
+            random_id()
+        )
+    };
+    let path = folder.join(name);
+    if reason == "diario" && path.exists() {
+        return Ok(path);
+    }
+    // SQLite creates a consistent snapshot, including committed WAL pages.
+    db.execute("VACUUM main INTO ?1", [path.to_string_lossy().as_ref()])
+        .map_err(|e| format!("No se pudo crear el respaldo automático: {e}"))?;
+    Ok(path)
+}
+fn initialize_database(db: &mut Connection) -> AppResult<()> {
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        CREATE TABLE IF NOT EXISTS quotes(id TEXT PRIMARY KEY,payload TEXT NOT NULL,updated TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+        CREATE TABLE IF NOT EXISTS quote_revisions(quote_id TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL, saved_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now')),PRIMARY KEY(quote_id,revision));").map_err(|e|e.to_string())?;
+    let existing: Vec<(String, String, String)> = {
+        let mut stmt = db
+            .prepare("SELECT id,payload,updated FROM quotes")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+    };
+    let tx = db.transaction().map_err(|e| e.to_string())?;
+    for (id, payload, updated) in existing {
+        let q: Quote = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+        tx.execute("INSERT OR IGNORE INTO quote_revisions(quote_id,revision,payload,saved_at) VALUES(?1,?2,?3,?4)",params![id,q.revision,payload,updated]).map_err(|e|e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
 fn handle(
     req: &mut Request,
     db: &mut Connection,
@@ -511,7 +554,7 @@ fn handle(
             200,
             json_mime,
             json_bytes(
-                json!({"data_dir":dir.display().to_string(),"version":env!("CARGO_PKG_VERSION")}),
+                json!({"data_dir":dir.display().to_string(),"backup_dir":dir.join("respaldos-automaticos").display().to_string(),"version":env!("CARGO_PKG_VERSION")}),
             ),
         ));
     }
@@ -548,11 +591,27 @@ fn handle(
             let (id, p) = r.map_err(|e| e.to_string())?;
             result.push(json!({"id":id,"quote":serde_json::from_str::<Quote>(&p).map_err(|e|e.to_string())?}));
         }
+        let mut stmt=db.prepare("SELECT quote_id,revision,payload,saved_at FROM quote_revisions ORDER BY quote_id,revision").map_err(|e|e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut history = Vec::new();
+        for row in rows {
+            let (id, revision, payload, saved_at) = row.map_err(|e| e.to_string())?;
+            history.push(json!({"id":id,"revision":revision,"quote":serde_json::from_str::<Quote>(&payload).map_err(|e|e.to_string())?,"saved_at":saved_at}));
+        }
         return Ok((
             200,
             json_mime,
             json_bytes(
-                json!({"format":"gridepos-backup","version":1,"created":Local::now().to_rfc3339(),"quotes":result}),
+                json!({"format":"gridepos-backup","version":1,"created":Local::now().to_rfc3339(),"quotes":result,"history":history}),
             ),
         ));
     }
@@ -563,14 +622,27 @@ fn handle(
             quote: Quote,
         }
         #[derive(Deserialize)]
+        struct HistoryEntry {
+            id: String,
+            revision: i64,
+            quote: Quote,
+            saved_at: String,
+        }
+        #[derive(Deserialize)]
         struct Backup {
             format: String,
             version: u32,
             quotes: Vec<Entry>,
+            #[serde(default)]
+            history: Vec<HistoryEntry>,
         }
         let v: Backup = serde_json::from_slice(&read_body(req)?)
             .map_err(|_| "El archivo no es un respaldo válido de GridePOS.".to_string())?;
-        if v.format != "gridepos-backup" || v.version != 1 || v.quotes.len() > 10000 {
+        if v.format != "gridepos-backup"
+            || v.version != 1
+            || v.quotes.len() > 10000
+            || v.history.len() > 100000
+        {
             return Err("Formato de respaldo incompatible.".into());
         }
         for e in &v.quotes {
@@ -579,16 +651,50 @@ fn handle(
                 return Err("Identificador inválido en respaldo.".into());
             }
         }
+        let ids: std::collections::HashSet<_> = v.quotes.iter().map(|e| e.id.as_str()).collect();
+        if ids.len() != v.quotes.len() {
+            return Err("El respaldo contiene identificadores duplicados.".into());
+        }
+        for e in &v.history {
+            e.quote.validate()?;
+            if !ids.contains(e.id.as_str())
+                || e.revision != e.quote.revision
+                || e.revision < 0
+                || e.saved_at.len() > 100
+            {
+                return Err("Historial de versiones inválido en el respaldo.".into());
+            }
+        }
+        automatic_backup(db, dir, "antes-de-restaurar")?;
         // Merge only missing IDs. Existing quotations are never overwritten by restore.
         let tx = db.transaction().map_err(|e| e.to_string())?;
         let mut restored = 0;
+        let mut added = std::collections::HashSet::new();
         for e in &v.quotes {
-            restored += tx
+            let inserted = tx
                 .execute(
                     "INSERT OR IGNORE INTO quotes(id,payload) VALUES (?1,?2)",
                     params![e.id, serde_json::to_string(&e.quote).unwrap()],
                 )
                 .map_err(|e| e.to_string())?;
+            restored += inserted;
+            if inserted > 0 {
+                added.insert(e.id.as_str());
+                tx.execute(
+                    "INSERT INTO quote_revisions(quote_id,revision,payload) VALUES(?1,?2,?3)",
+                    params![
+                        e.id,
+                        e.quote.revision,
+                        serde_json::to_string(&e.quote).unwrap()
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        for e in &v.history {
+            if added.contains(e.id.as_str()) {
+                tx.execute("INSERT OR IGNORE INTO quote_revisions(quote_id,revision,payload,saved_at) VALUES(?1,?2,?3,?4)",params![e.id,e.revision,serde_json::to_string(&e.quote).unwrap(),e.saved_at]).map_err(|e|e.to_string())?;
+            }
         }
         tx.commit().map_err(|e| e.to_string())?;
         return Ok((
@@ -596,6 +702,46 @@ fn handle(
             json_mime,
             json_bytes(json!({"restored":restored,"skipped":v.quotes.len()-restored})),
         ));
+    }
+    if method == "GET" && path.starts_with("/api/revisions/") {
+        let parts: Vec<_> = path
+            .trim_start_matches("/api/revisions/")
+            .split('/')
+            .collect();
+        if parts.len() == 2 {
+            let revision: i64 = parts[1].parse().map_err(|_| "Revisión inválida")?;
+            let payload: Option<String> = db
+                .query_row(
+                    "SELECT payload FROM quote_revisions WHERE quote_id=?1 AND revision=?2",
+                    params![parts[0], revision],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            return Ok(match payload {
+                Some(p) => (200, json_mime, p.into_bytes()),
+                None => (
+                    404,
+                    json_mime,
+                    json_bytes(json!({"error":"Versión no encontrada"})),
+                ),
+            });
+        }
+        if parts.len() != 1 {
+            return Err("Ruta de historial inválida".into());
+        }
+        let mut stmt=db.prepare("SELECT revision,saved_at FROM quote_revisions WHERE quote_id=?1 ORDER BY revision DESC").map_err(|e|e.to_string())?;
+        let rows = stmt
+            .query_map([parts[0]], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (revision, saved_at) = row.map_err(|e| e.to_string())?;
+            result.push(json!({"revision":revision,"saved_at":saved_at}));
+        }
+        return Ok((200, json_mime, json_bytes(json!(result))));
     }
     let id = path.strip_prefix("/api/quotes/").map(str::to_owned);
     if method == "GET" {
@@ -648,6 +794,9 @@ fn handle(
                 }
             };
             let previous: Quote = serde_json::from_str(&old).map_err(|e| e.to_string())?;
+            if q.kind != previous.kind {
+                return Err("Duplica o convierte el documento para cambiar de tipo.".into());
+            }
             if q.revision != previous.revision {
                 return Ok((
                     409,
@@ -670,6 +819,11 @@ fn handle(
             .map_err(|e| e.to_string())?;
             (id, q.revision)
         };
+        tx.execute(
+            "INSERT INTO quote_revisions(quote_id,revision,payload) VALUES(?1,?2,?3)",
+            params![id, revision, serde_json::to_string(&q).unwrap()],
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         return Ok((
             200,
@@ -690,7 +844,10 @@ fn run() -> AppResult<()> {
     let mut db = Connection::open(&db_path).map_err(|e| e.to_string())?;
     db.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
-    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS quotes(id TEXT PRIMARY KEY,payload TEXT NOT NULL,updated TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now')));").map_err(|e|e.to_string())?;
+    initialize_database(&mut db)?;
+    if let Err(e) = automatic_backup(&db, &dir, "diario") {
+        eprintln!("Aviso: {e}");
+    }
     let server = Server::http("127.0.0.1:0").map_err(|e| e.to_string())?;
     let address = server
         .server_addr()

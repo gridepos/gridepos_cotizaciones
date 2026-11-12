@@ -119,6 +119,18 @@ fn offline_storage_backup_and_security() {
     let saved: Value = serde_json::from_str(&b).unwrap();
     let id = saved["id"].as_str().unwrap().to_string();
     quote["revision"] = saved["revision"].clone();
+    let versions: Value = serde_json::from_str(
+        &app.call("GET", &format!("/api/revisions/{}", id), None, &[])
+            .1,
+    )
+    .unwrap();
+    assert_eq!(versions.as_array().unwrap().len(), 1);
+    let old: Value = serde_json::from_str(
+        &app.call("GET", &format!("/api/revisions/{}/1", id), None, &[])
+            .1,
+    )
+    .unwrap();
+    assert_eq!(old["revision"], 1);
     let (code, b) = app.call("PUT", &format!("/api/quotes/{}", id), Some(&quote), &[]);
     assert_eq!(code, 200);
     let saved: Value = serde_json::from_str(&b).unwrap();
@@ -135,9 +147,31 @@ fn offline_storage_backup_and_security() {
     assert_eq!(merged["skipped"], 1);
     let mut new_backup = backup.clone();
     new_backup["quotes"][0]["id"] = json!("0123456789abcdef0123456789abcdef0123456789abcdef");
+    let restored_id = new_backup["quotes"][0]["id"].clone();
+    for revision in new_backup["history"].as_array_mut().unwrap() {
+        revision["id"] = restored_id.clone();
+    }
     let merged: Value =
         serde_json::from_str(&app.call("POST", "/api/restore", Some(&new_backup), &[]).1).unwrap();
     assert_eq!(merged["restored"], 1);
+    let restored_versions: Value = serde_json::from_str(
+        &app.call(
+            "GET",
+            "/api/revisions/0123456789abcdef0123456789abcdef0123456789abcdef",
+            None,
+            &[],
+        )
+        .1,
+    )
+    .unwrap();
+    assert_eq!(restored_versions.as_array().unwrap().len(), 2);
+    assert_eq!(backup["history"].as_array().unwrap().len(), 2);
+    assert!(
+        fs::read_dir(dir.join("respaldos-automaticos"))
+            .unwrap()
+            .count()
+            >= 3
+    );
     let mut bad = new_backup.clone();
     bad["quotes"][0]["quote"]["equipment"][0]["tax"] = json!(101);
     assert_eq!(app.call("POST", "/api/restore", Some(&bad), &[]).0, 400);
